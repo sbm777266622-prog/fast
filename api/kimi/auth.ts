@@ -11,6 +11,60 @@ import { users as kimiUsers } from "./platform";
 import { findUserByUnionId, upsertUser } from "../queries/users";
 import type { TokenResponse } from "./types";
 
+// ==================== LOCAL AUTH (Railway Deployment) ====================
+
+const LOCAL_ADMIN = {
+  unionId: "local_admin_001",
+  name: "مدير النظام",
+  email: "admin@netcard.local",
+  role: "super_admin",
+  isActive: true,
+};
+
+export async function authenticateRequest(headers: Headers) {
+  // Always try local auth first for Railway
+  const localAuthEnabled = process.env.LOCAL_AUTH_ENABLED === "true";
+  
+  if (localAuthEnabled) {
+    const localUnionId = process.env.LOCAL_ADMIN_UNION_ID || LOCAL_ADMIN.unionId;
+    let user = await findUserByUnionId(localUnionId);
+    
+    if (!user) {
+      // Create local admin if not exists
+      user = await upsertUser({
+        unionId: localUnionId,
+        name: LOCAL_ADMIN.name,
+        email: LOCAL_ADMIN.email,
+        role: LOCAL_ADMIN.role,
+        isActive: true,
+      });
+    }
+    
+    if (user) {
+      return user;
+    }
+  }
+
+  // OAuth fallback (for Kimi integration)
+  const cookies = cookie.parse(headers.get("cookie") || "");
+  const token = cookies[Session.cookieName];
+  if (!token) {
+    console.warn("[auth] No session cookie found in request.");
+    throw Errors.forbidden("Invalid authentication token.");
+  }
+  const claim = await verifySessionToken(token);
+  if (!claim) {
+    throw Errors.forbidden("Invalid authentication token.");
+  }
+  const user = await findUserByUnionId(claim.unionId);
+  if (!user) {
+    throw Errors.forbidden("User not found. Please re-login.");
+  }
+  return user;
+}
+
+// ==================== OAUTH (Original) ====================
+
 async function exchangeAuthCode(
   code: string,
   redirectUri: string,
@@ -53,33 +107,6 @@ async function verifyAccessToken(
   return { userId, clientId };
 }
 
-export async function authenticateRequest(headers: Headers) {
-  // Local auth bypass for development
-  const localAuthEnabled = process.env.LOCAL_AUTH_ENABLED === "true";
-  if (localAuthEnabled) {
-    const localUnionId = process.env.LOCAL_ADMIN_UNION_ID || "local_admin_001";
-    const localUser = await findUserByUnionId(localUnionId);
-    if (localUser) {
-      return localUser;
-    }
-  }
-
-  const cookies = cookie.parse(headers.get("cookie") || "");
-  const token = cookies[Session.cookieName];
-  if (!token) {
-    console.warn("[auth] No session cookie found in request.");
-    throw Errors.forbidden("Invalid authentication token.");
-  }
-  const claim = await verifySessionToken(token);
-  if (!claim) {
-    throw Errors.forbidden("Invalid authentication token.");
-  }
-  const user = await findUserByUnionId(claim.unionId);
-  if (!user) {
-    throw Errors.forbidden("User not found. Please re-login.");
-  }
-  return user;
-}
 export function createOAuthCallbackHandler() {
   return async (c: Context) => {
     const code = c.req.query("code");
@@ -95,59 +122,4 @@ export function createOAuthCallbackHandler() {
         { error, error_description: errorDescription },
         400,
       );
-    }
-
-    if (!code || !state) {
-      return c.json({ error: "code and state are required" }, 400);
-    }
-
-    try {
-      const redirectUri = atob(state);
-      const tokenResp = await exchangeAuthCode(code, redirectUri);
-      const { userId } = await verifyAccessToken(tokenResp.access_token);
-      const userProfile = await kimiUsers.getProfile(tokenResp.access_token);
-      if (!userProfile) {
-        throw new Error("Failed to fetch user profile from Kimi Open");
-      }
-
-      await upsertUser({
-        unionId: userId,
-        name: userProfile.name,
-        avatar: userProfile.avatar_url,
-        lastSignInAt: new Date(),
-      });
-
-      const token = await signSessionToken({
-        unionId: userId,
-        clientId: env.appId,
-      });
-
-      const cookieOpts = getSessionCookieOptions(c.req.raw.headers);
-      setCookie(c, Session.cookieName, token, {
-        ...cookieOpts,
-        maxAge: Session.maxAgeMs / 1000,
-      });
-
-      return c.redirect("/", 302);
-    } catch (error) {
-      console.error("[OAuth] Callback failed", error);
-      return c.json({ error: "OAuth callback failed" }, 500);
-    }
-  };
-}
-// ==================== LOCAL AUTH (Development) ====================
-
-export async function authenticateLocalRequest(headers: Headers) {
-  // Check for local auth header
-  const localAuth = headers.get("x-local-auth");
-  if (localAuth === "enabled") {
-    const localUser = await findUserByUnionId("local_admin_001");
-    if (localUser) {
-      return localUser;
-    }
-  }
-  
-  // Fall back to normal auth
-  return authenticateRequest(headers);
-}
-export { exchangeAuthCode, verifyAccessToken };
+   
